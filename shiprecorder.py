@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
     # 下面是按 MFEC 设置页对齐的功能
     "pre_roll_seconds": 5,    # 前置预录制：扫码前 N 秒画面也存进视频
     "zoom_after_scan": {"enabled": True, "delay": 2, "duration": 3},
+    "voice_prompt": True,     # 扫码后放大时语音播报“放大显示”（Windows 自带语音，无需联网）
     "max_record_seconds": 200,  # 单段最长录制秒数，到时自动保存
     "segment_seconds": 300,   # 每 N 秒分一段（0 = 不分段）
     "save_days": 40,          # 视频保留天数，到期自动删除（0 = 不删）
@@ -65,6 +66,29 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def speak(text):
+    """语音播报（Windows 自带 SAPI 语音，无需联网）。
+    后台线程发声，绝不阻塞界面和录制；没装语音库或发声失败就静默跳过。"""
+    def _run():
+        try:
+            import pyttsx3
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+            engine = pyttsx3.init()
+            engine.say(text)
+            engine.runAndWait()
+            try:
+                engine.stop()
+            except Exception:
+                pass
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def load_count():
@@ -278,6 +302,14 @@ class Recorder:
             self.writer = writer
             self.tracking_no = tracking_no
             self.record_start = time.time()
+            # 放大窗口以扫码时刻为准（不要等预录制写完才起算，否则高分辨率下会晚好几秒）
+            z = self.cfg.get("zoom_after_scan") or {}
+            if z.get("enabled"):
+                self._zoom_from = self.record_start + float(z.get("delay", 2))
+                self._zoom_until = self._zoom_from + float(z.get("duration", 3))
+            else:
+                self._zoom_from = None
+                self._zoom_until = None
             self._segment_start = self.record_start
             self._part_index = 1
             self.last_motion = time.time()
@@ -299,13 +331,6 @@ class Recorder:
                         self._seg_written += 1
                 except Exception:
                     pass
-            z = self.cfg.get("zoom_after_scan") or {}
-            if z.get("enabled"):
-                self._zoom_from = time.time() + float(z.get("delay", 2))
-                self._zoom_until = self._zoom_from + float(z.get("duration", 3))
-            else:
-                self._zoom_from = None
-                self._zoom_until = None
         return True, "开始录制：%s" % fname
 
     def stop_recording(self, save=True):
@@ -892,6 +917,20 @@ class App:
             frame = self._placeholder()
         else:
             frame = frame.copy()
+        # 扫码后放大：预览画面跟着放大显示，并语音播报“放大显示”。
+        # 录像帧在 Recorder 里已经放大过，这里只给预览副本压个大字（不进录像）。
+        if self.rec.recording and self.rec._zoom_active():
+            if not getattr(self, "_zoom_spoken", False):
+                self._zoom_spoken = True
+                if self.cfg.get("voice_prompt", True):
+                    speak("放大显示")
+            fh, fw = frame.shape[:2]
+            ts = 72
+            tx = max(16, (fw - ts * 4) // 2)
+            frame = draw_text_cn(frame, "放大显示", (tx, 24), size=ts,
+                                 color=(255, 255, 255), stroke=3)
+        else:
+            self._zoom_spoken = False
         if self.rec.recording and self.rec.record_start:
             el = int(time.time() - self.rec.record_start)
             frame = draw_text_cn(frame, "● 录制中 %02d:%02d" % (el // 60, el % 60),
@@ -1201,6 +1240,9 @@ class App:
         spin(r, zt_var, 1, 10, width=4)
         tk.Label(r, text="秒", bg=self.C_CARD, fg=self.C_TEXT,
                  font=self.F_BODY).pack(side=tk.LEFT, padx=2)
+        r = row(sec, "语音播报", "放大时读“放大显示”")
+        voice_v = tk.BooleanVar(value=bool(cfg.get("voice_prompt", True)))
+        check(r, "启用", voice_v).pack(side=tk.LEFT)
         r = row(sec, "单段最长", "秒，到时自动保存")
         max_var = tk.IntVar(value=int(cfg.get("max_record_seconds") or 200))
         spin(r, max_var, 30, 3600)
@@ -1251,6 +1293,7 @@ class App:
             self.cfg["zoom_after_scan"] = {"enabled": bool(zoom_var.get()),
                                            "delay": int(zd_var.get()),
                                            "duration": int(zt_var.get())}
+            self.cfg["voice_prompt"] = bool(voice_v.get())
             self.cfg["max_record_seconds"] = int(max_var.get())
             self.cfg["segment_seconds"] = int(seg_var.get())
             self.cfg["auto_stop_seconds"] = int(auto_var.get())

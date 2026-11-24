@@ -43,7 +43,8 @@ DEFAULT_CONFIG = {
     # 下面是按 MFEC 设置页对齐的功能
     "pre_roll_seconds": 5,    # 前置预录制：扫码前 N 秒画面也存进视频
     "zoom_after_scan": {"enabled": True, "delay": 2, "duration": 3},
-    "voice_prompt": True,     # 扫码后放大时语音播报“放大显示”（Windows 自带语音，无需联网）
+    "voice_prompt": True,     # 扫码后放大时语音播报（Windows 自带语音，无需联网）
+    "voice_text": "凯博好帅",   # 语音播报的文字（设置里可改）
     "max_record_seconds": 200,  # 单段最长录制秒数，到时自动保存
     "segment_seconds": 300,   # 每 N 秒分一段（0 = 不分段）
     "save_days": 40,          # 视频保留天数，到期自动删除（0 = 不删）
@@ -68,26 +69,109 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
-def speak(text):
-    """语音播报（Windows 自带 SAPI 语音，无需联网）。
-    后台线程发声，绝不阻塞界面和录制；没装语音库或发声失败就静默跳过。"""
-    def _run():
+def _play_mp3_windows(path):
+    """Windows 下用系统 winmm 播放 mp3（只用标准库，无需任何第三方库）。"""
+    try:
+        import ctypes
+        winmm = ctypes.windll.winmm
+        winmm.mciSendStringW("close shiprec_mp3", None, 0, None)
+        cmd_open = 'open "%s" type mpegvideo alias shiprec_mp3' % path.replace('"', '')
+        if winmm.mciSendStringW(cmd_open, None, 0, None) != 0:
+            return False
         try:
-            import pyttsx3
+            winmm.mciSendStringW("play shiprec_mp3 wait", None, 0, None)
+        finally:
+            winmm.mciSendStringW("close shiprec_mp3", None, 0, None)
+        return True
+    except Exception:
+        return False
+
+
+def _speak_edge(text):
+    """Edge 在线甜美女声（晓晓）。返回 True 表示播报成功。"""
+    try:
+        import asyncio
+        import os
+        import tempfile
+        import edge_tts
+
+        async def _gen(path):
+            communicate = edge_tts.Communicate(
+                text, "zh-CN-XiaoxiaoNeural", rate="+10%")
+            await asyncio.wait_for(communicate.save(path), timeout=10)
+
+        fd, path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        try:
+            asyncio.run(_gen(path))
+            if not _play_mp3_windows(path):
+                return False
+        finally:
             try:
-                import pythoncom
-                pythoncom.CoInitialize()
+                os.remove(path)
             except Exception:
                 pass
-            engine = pyttsx3.init()
-            engine.say(text)
-            engine.runAndWait()
-            try:
-                engine.stop()
-            except Exception:
-                pass
+        return True
+    except Exception:
+        return False
+
+
+def _speak_sapi(text):
+    """Windows 自带语音兜底：优先挑晓晓等年轻女声。"""
+    try:
+        import pyttsx3
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
         except Exception:
             pass
+        engine = pyttsx3.init()
+
+        def _score(v):
+            name = getattr(v, "name", "") or ""
+            low = name.lower()
+            if "xiaoxiao" in low or "晓晓" in name:
+                return 0
+            if "xiaoyi" in low or "晓伊" in name:
+                return 1
+            if "xiaochen" in low or "晓辰" in name:
+                return 2
+            if "huihui" in low or "xiaohan" in low or "晓涵" in name:
+                return 3
+            langs = " ".join(getattr(v, "languages", []) or [])
+            if "zh" in langs.lower() or "chinese" in low or "中文" in name:
+                return 4
+            return 9
+
+        try:
+            voices = engine.getProperty("voices") or []
+            if voices:
+                best = min(voices, key=_score)
+                if _score(best) < 9:
+                    engine.setProperty("voice", best.id)
+        except Exception:
+            pass
+        try:
+            engine.setProperty("rate", 210)
+        except Exception:
+            pass
+        engine.say(text)
+        engine.runAndWait()
+        try:
+            engine.stop()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def speak(text):
+    """语音播报：优先 Edge 甜美女声，失败回落 Windows 自带语音。
+    后台线程发声，绝不阻塞界面和录制；全部失败就静默跳过。"""
+    def _run():
+        if _speak_edge(text):
+            return
+        _speak_sapi(text)
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -923,7 +1007,7 @@ class App:
             if not getattr(self, "_zoom_spoken", False):
                 self._zoom_spoken = True
                 if self.cfg.get("voice_prompt", True):
-                    speak("放大显示")
+                    speak(self.cfg.get("voice_text", "凯博好帅") or "凯博好帅")
             fh, fw = frame.shape[:2]
             ts = 72
             tx = max(16, (fw - ts * 4) // 2)
@@ -1240,9 +1324,11 @@ class App:
         spin(r, zt_var, 1, 10, width=4)
         tk.Label(r, text="秒", bg=self.C_CARD, fg=self.C_TEXT,
                  font=self.F_BODY).pack(side=tk.LEFT, padx=2)
-        r = row(sec, "语音播报", "放大时读“放大显示”")
+        r = row(sec, "语音播报", "放大时读下面的话")
         voice_v = tk.BooleanVar(value=bool(cfg.get("voice_prompt", True)))
         check(r, "启用", voice_v).pack(side=tk.LEFT)
+        voice_t = tk.StringVar(value=cfg.get("voice_text", "凯博好帅"))
+        entry(r, voice_t, width=12)
         r = row(sec, "单段最长", "秒，到时自动保存")
         max_var = tk.IntVar(value=int(cfg.get("max_record_seconds") or 200))
         spin(r, max_var, 30, 3600)
@@ -1294,6 +1380,7 @@ class App:
                                            "delay": int(zd_var.get()),
                                            "duration": int(zt_var.get())}
             self.cfg["voice_prompt"] = bool(voice_v.get())
+            self.cfg["voice_text"] = voice_t.get().strip() or "凯博好帅"
             self.cfg["max_record_seconds"] = int(max_var.get())
             self.cfg["segment_seconds"] = int(seg_var.get())
             self.cfg["auto_stop_seconds"] = int(auto_var.get())

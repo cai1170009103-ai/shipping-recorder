@@ -1,0 +1,42 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --noconfirm --onefile --windowed --name "发货录制终端" shiprecorder.py
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0
+          name: 发货录制终端 v1.0
+          body: |
+            发货录制终端 v1.0（MFEC 录制终端免费平替）
+            下载下面的 exe，双击就能用，不用装 Python。
+            摄像头、扫码枪、保存文件夹等在软件右上角“设置”里调。
+          files: dist/*.exe
+
+
+

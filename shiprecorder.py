@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-凯博助手 v1.2 —— 免费自用版
+凯博助手 v1.3 —— 免费自用版
 功能：摄像头取景 + 扫码单号触发录制 + 时间戳/单号水印烧进视频 + 按单号命名保存 + 今日计数
 用法：双击 run.bat 启动；把摄像头架在打包台正上方，扫码枪扫快递单号后开始录制，
      打包完成后点“停止”或直接扫下一单（自动保存上一段并开始新一段）。
@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "凯博助手"
-VERSION = "v1.2"
+VERSION = "v1.3"
 if getattr(sys, "frozen", False):
     # PyInstaller onefile 打包后：__file__ 指向每次启动都重建的临时解压目录，
     # 配置写在那里，关掉软件就没了，下次启动又得重选摄像头。
@@ -60,6 +60,9 @@ DEFAULT_CONFIG = {
     "barcode_filter": "",     # 条码过滤正则，空 = 不过滤
     "global_scan": False,     # 扫码枪全局监听（需 keyboard 库；窗口没焦点时也能扫码触发）
     "photo_only": False,      # 仅拍照模式：扫码只拍一张照片，不录视频
+    "codec": "auto",          # 视频编码：auto（优先 H.264，打不开回落 mp4v）/ h264 / mp4v
+    "disk_min_free_mb": 500,  # 磁盘保护：录制中剩余空间低于此值（MB）自动停录保存，0 = 关
+    "reconnect_timeout": 30,  # 断线重连：录制中断线超过此值（秒）自动停录保存，0 = 不停
 }
 
 
@@ -322,6 +325,47 @@ def draw_text_cn(frame_bgr, text, xy, size=30, color=(0, 0, 255), stroke=2):
     return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
 
+_LABEL_NP_CACHE = {}
+
+
+def _label_np(text, size, rgb, stroke=2):
+    """render_label 的 numpy 版：预渲染一次，缓存 RGB + alpha（float32），
+    每帧贴文字时只混合标签包围盒那一小块，不用整帧转格式。"""
+    key = (text, size, rgb, stroke)
+    if key in _LABEL_NP_CACHE:
+        return _LABEL_NP_CACHE[key]
+    label = render_label(text, size=size, rgb=rgb, stroke=stroke)
+    arr = np.array(label)  # RGBA
+    rgb_arr = arr[:, :, :3].astype(np.float32)
+    alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
+    if len(_LABEL_NP_CACHE) > 64:
+        _LABEL_NP_CACHE.clear()
+    _LABEL_NP_CACHE[key] = (rgb_arr, alpha)
+    return _LABEL_NP_CACHE[key]
+
+
+def paste_label(frame_bgr, text, xy, size=30, color=(0, 0, 255), stroke=2):
+    """在 BGR 帧指定位置贴一行中文（红字黑边），只混合标签包围盒区域，
+    不做整帧 PIL 转换。原地修改并返回同一帧。color 为 BGR。"""
+    rgb = (color[2], color[1], color[0])
+    rgb_arr, alpha = _label_np(text, size, rgb, stroke)
+    lh, lw = alpha.shape[:2]
+    x, y = xy
+    fh, fw = frame_bgr.shape[:2]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(fw, x + lw), min(fh, y + lh)
+    if x2 <= x1 or y2 <= y1:
+        return frame_bgr
+    lx1, ly1 = x1 - x, y1 - y
+    lx2, ly2 = lx1 + (x2 - x1), ly1 + (y2 - y1)
+    # 标签是 RGB，帧是 BGR：通道翻过来再按 alpha 混合
+    region = frame_bgr[y1:y2, x1:x2].astype(np.float32)
+    lab = rgb_arr[ly1:ly2, lx1:lx2][:, :, ::-1]
+    a = alpha[ly1:ly2, lx1:lx2]
+    frame_bgr[y1:y2, x1:x2] = (region * (1 - a) + lab * a).astype(np.uint8)
+    return frame_bgr
+
+
 def draw_dashed_rect(frame, pt1, pt2, color=(0, 0, 255), thickness=2, dash=18):
     """画虚线矩形（取景框）。"""
     x1, y1 = pt1
@@ -408,8 +452,20 @@ class Recorder:
         self.loop_fps = 0.0
         self._fps_count = 0
         self._fps_time = time.time()
+        self._codec = None            # 本次胜出的视频编码（avc1/mp4v），分段/校准沿用
+        self._cam_fail = 0            # 连续读不到帧的次数（断线重连用）
+        self._cam_down_since = None   # 摄像头断线起始时间
+        self._run_id = 0              # 采集线程代号：防旧线程在重开摄像头后继续跑
+        self._disk_check_t = 0
 
     def open_camera(self):
+        # 先放掉旧的摄像头句柄（重连/重开时不留泄漏，否则新开可能失败）
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
         if self.test_video:
             self.cap = cv2.VideoCapture(self.test_video)
         else:
@@ -482,17 +538,29 @@ class Recorder:
         # 前置预录制缓冲：按帧率算出要缓存的帧数
         pre = float(self.cfg.get("pre_roll_seconds") or 0)
         self._preroll = deque(maxlen=int(self.fps * pre)) if pre > 0 else None
+        if self._stop_event.is_set():
+            # 关软件/关摄像头时正好在重连：刚打开的立刻放掉，避免句柄泄漏
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+            return False
         return True
 
     def start(self):
         if self.running:
             return True
+        # 先清停止标志，再开摄像头：open_camera 末尾要靠它判断是不是在关软件
+        self._stop_event.clear()
         if not self.open_camera():
             self.on_status("摄像头打不开：请检查摄像头是否已接好，或在设置里换一个摄像头。")
             return False
-        self._stop_event.clear()
+        self._run_id += 1
+        rid = self._run_id
         self.running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, args=(rid,),
+                                        daemon=True)
         self._thread.start()
         return True
 
@@ -506,18 +574,93 @@ class Recorder:
             self.cap = None
         self.running = False
 
+    def _make_writer(self, path, fps, size):
+        """建 VideoWriter：优先 avc1（H.264，文件约小一半），打不开再回落 mp4v。
+        记住胜出的编码，分段/校准时沿用同一个，不混编码。"""
+        codec = (self.cfg.get("codec") or "auto").lower()
+        if codec == "h264":
+            order = ["avc1"]
+        elif codec == "mp4v":
+            order = ["mp4v"]
+        elif getattr(self, "_codec", None):
+            # 自动模式且已有胜出编码：先用它，失败再试另一个
+            order = [self._codec,
+                     "mp4v" if self._codec == "avc1" else "avc1"]
+        else:
+            order = ["avc1", "mp4v"]
+        writer = None
+        for fourcc_s in order:
+            fourcc = cv2.VideoWriter_fourcc(*fourcc_s)
+            w = cv2.VideoWriter(path, fourcc, fps, size)
+            if w.isOpened():
+                self._codec = fourcc_s
+                return w
+            w.release()
+            writer = w
+        # 都打不开：返回最后一个（未打开），调用方按 isOpened() 判断
+        self._codec = order[-1]
+        return writer
+
+    def _disk_free_mb(self):
+        """保存盘剩余空间（MB），拿不到返回 None。"""
+        try:
+            d = self.cfg.get("save_dir") or ""
+            if d and os.path.isdir(d):
+                return shutil.disk_usage(d).free / (1024 ** 2)
+        except Exception:
+            pass
+        return None
+
+    def _free_disk_space(self, min_free_mb):
+        """磁盘快满时删最旧的本软件视频腾空间，直到剩余 >= 阈值。
+        正在录的当前段和上一段不删。返回删了几个。"""
+        try:
+            save_dir = self.cfg.get("save_dir") or ""
+            if not save_dir or not os.path.isdir(save_dir):
+                return 0
+            pat = re.compile(r"^[\w\-]+_\d{8}_\d{6}(_part\d+)?\.(mp4|jpg)$")
+            keep = {os.path.abspath(getattr(self, "_current_path", "") or ""),
+                    os.path.abspath(getattr(self, "_prev_path", "") or "")}
+            names = [n for n in os.listdir(save_dir) if pat.match(n)]
+            names.sort(key=lambda n: os.path.getmtime(
+                os.path.join(save_dir, n)))
+            n = 0
+            for name in names:
+                if (self._disk_free_mb() or 0) >= min_free_mb:
+                    break
+                p = os.path.join(save_dir, name)
+                if os.path.abspath(p) in keep:
+                    continue
+                try:
+                    os.remove(p)
+                    n += 1
+                except Exception:
+                    pass
+            return n
+        except Exception:
+            return 0
+
     def start_recording(self, tracking_no):
         tracking_no = clean_number(tracking_no)
         if not tracking_no:
             return False, "请先输入或扫描单号。"
         if self.recording:
             self.stop_recording(save=True)
+        # 磁盘满保护：空间不够先删最旧视频腾空间，还不够就拒绝开始录制
+        min_free = int(self.cfg.get("disk_min_free_mb") or 0)
+        if min_free > 0:
+            free = self._disk_free_mb()
+            if free is not None and free < min_free:
+                self._free_disk_space(min_free)
+                free = self._disk_free_mb()
+            if free is not None and free < min_free:
+                return False, ("磁盘空间不足（剩余 %.0fMB）：已自动删旧视频也腾不出空间，"
+                               "请先清理磁盘或把保存文件夹改到空间大的盘。" % free)
         os.makedirs(self.cfg["save_dir"], exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = "%s_%s.mp4" % (tracking_no, ts)
         path = os.path.join(self.cfg["save_dir"], fname)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(path, fourcc, self.fps, self.frame_size)
+        writer = self._make_writer(path, self.fps, self.frame_size)
         if not writer.isOpened():
             return False, "写视频文件失败：请检查保存文件夹是否可写。"
         # 状态和预录制写入都在同一把锁里做，避免采集线程同时写
@@ -625,8 +768,7 @@ class Recorder:
             if not cap.isOpened():
                 return
             tmp = path + ".tmp.mp4"
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            w = cv2.VideoWriter(tmp, fourcc, target_fps, self.frame_size)
+            w = self._make_writer(tmp, target_fps, self.frame_size)
             if not w.isOpened():
                 cap.release()
                 return
@@ -710,9 +852,7 @@ class Recorder:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             fname = "%s_%s_part%d.mp4" % (self.tracking_no, ts, self._part_index)
             path = os.path.join(self.cfg["save_dir"], fname)
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self.writer = cv2.VideoWriter(path, fourcc, self.fps,
-                                          self.frame_size)
+            self.writer = self._make_writer(path, self.fps, self.frame_size)
             self._segment_start = time.time()
             self._seg_start = self._segment_start
             self._seg_written = 0
@@ -720,17 +860,66 @@ class Recorder:
         self._maybe_calibrate(old_path, old_written, old_start)
         self.on_status("分段：已另存一段 %s，继续录制。" % fname)
 
-    def _loop(self):
-        while not self._stop_event.is_set():
+    def _loop(self, run_id=None):
+        while not self._stop_event.is_set() and run_id == self._run_id:
+            if self.cap is None:
+                # 上次重连失败：等一会儿再试；录制中断线太久就保存已录部分
+                if self.recording and self._cam_down_since:
+                    timeout = int(self.cfg.get("reconnect_timeout") or 30)
+                    if timeout > 0 and \
+                            time.time() - self._cam_down_since > timeout:
+                        path = self.stop_recording(save=True)
+                        if path:
+                            self.on_status("AUTO_SAVED::" + path)
+                        self.on_status("摄像头断线超过 %d 秒，已停止录制并保存。"
+                                       % timeout)
+                        self._cam_down_since = None
+                time.sleep(1.0)
+                if self._stop_event.is_set() or run_id != self._run_id:
+                    break
+                if self.open_camera():
+                    self.on_status("摄像头已自动重连。")
+                    self._cam_down_since = None
+                    self._cam_fail = 0
+                continue
             ok, frame = self.cap.read()
             if not ok:
                 if self.test_video:
                     # 测试视频播完，循环重播
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
-                self.on_status("摄像头断开了：请重新插拔摄像头后点“重连摄像头”。")
+                # 摄像头断线：连续读不到帧就重开摄像头
+                if self._cam_fail == 0:
+                    self._cam_down_since = time.time()
+                    self.on_status("摄像头断开了，正在自动重连…")
+                self._cam_fail += 1
+                if self._cam_fail >= 10:
+                    self._cam_fail = 0
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+                    if self.open_camera():
+                        self.on_status("摄像头已自动重连。")
+                        self._cam_down_since = None
+                    # open_camera 失败就留 cap=None，下轮循环顶部再试
+                    continue
+                # 录制中断线太久：保存已录部分，避免一直空等
+                if self.recording and self._cam_down_since:
+                    timeout = int(self.cfg.get("reconnect_timeout") or 30)
+                    if timeout > 0 and \
+                            time.time() - self._cam_down_since > timeout:
+                        path = self.stop_recording(save=True)
+                        if path:
+                            self.on_status("AUTO_SAVED::" + path)
+                        self.on_status("摄像头断线超过 %d 秒，已停止录制并保存。"
+                                       % timeout)
+                        self._cam_down_since = None
                 time.sleep(0.5)
                 continue
+            self._cam_fail = 0
+            self._cam_down_since = None
             if frame.shape[1] != self._native_size[0] or frame.shape[0] != self._native_size[1]:
                 frame = cv2.resize(frame, self._native_size)
             if self._crop_rect:
@@ -748,7 +937,7 @@ class Recorder:
             # 预录制环形缓冲（没录制时也在缓存；存 JPG 省内存，4K 也不怕）
             if self._preroll is not None:
                 ok_j, buf = cv2.imencode(".jpg", frame,
-                                         [cv2.IMWRITE_JPEG_QUALITY, 85])
+                                         [cv2.IMWRITE_JPEG_QUALITY, 70])
                 if ok_j:
                     self._preroll.append((buf.tobytes(), time.time()))
             if self.recording:
@@ -803,12 +992,9 @@ class Recorder:
         if self.recording and self.tracking_no:
             labels.append(("扫码单号：%s" % self.tracking_no,
                            (16, h - 56), size, (0, 0, 255)))
-        if labels:
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
-            for text, xy, sz, bgr in labels:
-                rgb = (bgr[2], bgr[1], bgr[0])
-                img.alpha_composite(render_label(text, size=sz, rgb=rgb), xy)
-            frame = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        # 只混合每行标签的包围盒区域，不做整帧 PIL 转换（省 CPU）
+        for text, xy, sz, bgr in labels:
+            paste_label(frame, text, xy, size=sz, color=bgr)
         # 时间戳用 cv2 快画（毫秒精确，红字黑底）
         now = datetime.datetime.now()
         ts = now.strftime("%Y-%m-%d %H:%M:%S.") + "%03d" % (now.microsecond // 1000)
@@ -999,7 +1185,7 @@ class App:
         self.root.configure(bg=BG)
 
         # ===== 顶栏（深蓝）=====
-        top = tk.Frame(self.root, bg=HEAD, height=58)
+        top = self.top_bar = tk.Frame(self.root, bg=HEAD, height=58)
         top.pack(fill=tk.X)
         top.pack_propagate(False)
         # logo 小方块
@@ -1020,13 +1206,6 @@ class App:
                                     font=("Microsoft YaHei", 10, "bold"),
                                     padx=10, pady=4)
         self.count_label.pack(side=tk.LEFT, padx=8)
-        # 磁盘 / 帧率（右侧小字）
-        self.disk_label = tk.Label(top, text="", bg=HEAD, fg="#C7D2DE",
-                                   font=self.F_SMALL)
-        self.disk_label.pack(side=tk.RIGHT, padx=(0, 6))
-        self.fps_label = tk.Label(top, text="", bg=HEAD, fg="#C7D2DE",
-                                  font=self.F_SMALL)
-        self.fps_label.pack(side=tk.RIGHT, padx=6)
         # 顶栏按钮（深色描边风）
         def head_btn(text, cmd):
             return self._flat_btn(top, text, self.C_HEAD_CHIP, font=self.F_SMALL,
@@ -1041,6 +1220,7 @@ class App:
         head_btn("拍照", self._take_photo).pack(side=tk.RIGHT, padx=4)
         self.fs_btn = head_btn("全屏", self._toggle_fullscreen)
         self.fs_btn.pack(side=tk.RIGHT, padx=4)
+        head_btn("打开文件夹", self._open_save_folder).pack(side=tk.RIGHT, padx=4)
 
         # ===== 模式行（分段选择器）=====
         mode_row = tk.Frame(self.root, bg=BG)
@@ -1065,10 +1245,30 @@ class App:
         tk.Label(mode_row, text="扫码枪扫单号后自动开始录制，扫下一单自动保存上一段",
                  bg=BG, fg=self.C_MUTED, font=self.F_SMALL).pack(side=tk.RIGHT)
 
-        # ===== 画面区（黑底卡片）=====
-        video_wrap = tk.Frame(self.root, bg="black", highlightbackground=self.C_LINE,
+        # ===== 当前单号大字条（扫码后一眼看清是哪单）=====
+        cur = tk.Frame(self.root, bg=self.C_CARD,
+                       highlightbackground=self.C_LINE, highlightthickness=1)
+        cur.pack(fill=tk.X, padx=14, pady=(10, 0))
+        tk.Label(cur, text="当前单号", bg=self.C_CARD, fg=self.C_MUTED,
+                 font=self.F_BODY).pack(side=tk.LEFT, padx=(16, 8), pady=10)
+        self.cur_no_label = tk.Label(cur, text="—", bg=self.C_CARD,
+                                     fg=self.C_TEXT,
+                                     font=("Microsoft YaHei", 22, "bold"))
+        self.cur_no_label.pack(side=tk.LEFT, padx=4, pady=6)
+        self.cur_time_label = tk.Label(cur, text="未在录制", bg=self.C_CARD,
+                                       fg=self.C_MUTED, font=self.F_BIG)
+        self.cur_time_label.pack(side=tk.LEFT, padx=14)
+        tk.Label(cur, text="扫码后这里显示当前单号和已录时长",
+                 bg=self.C_CARD, fg="#9CA3AF",
+                 font=self.F_SMALL).pack(side=tk.RIGHT, padx=16)
+
+        # ===== 画面区（黑底卡片）+ 今日已录侧栏 =====
+        mid = tk.Frame(self.root, bg=BG)
+        mid.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+        video_wrap = self.video_wrap = tk.Frame(mid, bg="black",
+                              highlightbackground=self.C_LINE,
                               highlightthickness=1)
-        video_wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+        video_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.video_label = tk.Label(video_wrap, bg="black")
         self.video_label.pack(fill=tk.BOTH, expand=True)
         # 固定一个小的期望尺寸：让 pack 按剩余空间分配画面区，而不是按
@@ -1077,6 +1277,28 @@ class App:
         self.video_label.bind("<Double-Button-1>",
                               lambda e: self._toggle_fullscreen())
         self.root.bind("<Escape>", lambda e: self._set_fullscreen(False))
+        # 今日已录侧栏（双击一行打开视频）
+        side = tk.Frame(mid, bg=self.C_CARD,
+                        highlightbackground=self.C_LINE, highlightthickness=1,
+                        width=260)
+        side.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        side.pack_propagate(False)
+        tk.Label(side, text="今日已录", bg=self.C_CARD, fg=self.C_TEXT,
+                 font=("Microsoft YaHei", 12, "bold")).pack(
+                     anchor="w", padx=12, pady=(10, 2))
+        self.today_count_label = tk.Label(side, text="共 0 单", bg=self.C_CARD,
+                                          fg=self.C_MUTED, font=self.F_SMALL)
+        self.today_count_label.pack(anchor="w", padx=12)
+        self.today_tree = ttk.Treeview(side, columns=("time", "no", "dur"),
+                                       show="headings", height=14)
+        self.today_tree.heading("time", text="时间")
+        self.today_tree.heading("no", text="单号")
+        self.today_tree.heading("dur", text="时长")
+        self.today_tree.column("time", width=64)
+        self.today_tree.column("no", width=118)
+        self.today_tree.column("dur", width=44)
+        self.today_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.today_tree.bind("<Double-1>", self._open_today_video)
 
         # ===== 底部操作卡片 =====
         bottom = tk.Frame(self.root, bg=self.C_CARD,
@@ -1116,6 +1338,14 @@ class App:
         self.status_label.pack(side=tk.LEFT)
         tk.Label(status_bar, text="免费版 · 视频按单号命名保存",
                  bg=BG, fg="#9CA3AF", font=self.F_SMALL).pack(side=tk.RIGHT)
+        # 磁盘 / 帧率放到底部状态栏：顶栏按钮多了之后放不下，
+        # 而且帧率文字变长（“（偏低）”）会把最左边的顶栏按钮挤没
+        self.fps_label = tk.Label(status_bar, text="", bg=BG,
+                                  fg=self.C_MUTED, font=self.F_SMALL)
+        self.fps_label.pack(side=tk.RIGHT, padx=10)
+        self.disk_label = tk.Label(status_bar, text="", bg=BG,
+                                   fg=self.C_MUTED, font=self.F_SMALL)
+        self.disk_label.pack(side=tk.RIGHT, padx=2)
 
     def _set_fullscreen(self, on):
         """全屏开关：铺满整个屏幕，顶栏、扫码区、底部状态栏都还在，
@@ -1135,6 +1365,36 @@ class App:
         except Exception:
             cur = False
         self._set_fullscreen(not cur)
+
+    def _set_recording_chrome(self, on):
+        """录制状态更醒目：录制时顶栏变红、画面区加粗红框；停录恢复原样。"""
+        if on == getattr(self, "_chrome_red", False):
+            return
+        self._chrome_red = on
+        try:
+            head_bg = self.C_RED if on else self.C_HEAD
+            chip_bg = "#991B1B" if on else self.C_HEAD_CHIP
+            self.top_bar.config(bg=head_bg)
+            for wgt in self.top_bar.winfo_children():
+                try:
+                    cur_bg = wgt.cget("bg")
+                except Exception:
+                    continue
+                if on:
+                    if cur_bg == self.C_HEAD:
+                        wgt.config(bg=head_bg)
+                    elif cur_bg == self.C_HEAD_CHIP:
+                        wgt.config(bg=chip_bg)
+                else:
+                    if cur_bg == self.C_RED:
+                        wgt.config(bg=self.C_HEAD)
+                    elif cur_bg == "#991B1B":
+                        wgt.config(bg=self.C_HEAD_CHIP)
+            self.video_wrap.config(
+                highlightbackground=self.C_RED if on else self.C_LINE,
+                highlightthickness=3 if on else 1)
+        except Exception:
+            pass
 
     def _restyle_mode_btns(self):
         cur = self.mode_var.get()
@@ -1210,14 +1470,14 @@ class App:
             fh, fw = frame.shape[:2]
             ts = 72
             tx = max(16, (fw - ts * 4) // 2)
-            frame = draw_text_cn(frame, "放大显示", (tx, 24), size=ts,
-                                 color=(255, 255, 255), stroke=3)
+            paste_label(frame, "放大显示", (tx, 24), size=ts,
+                        color=(255, 255, 255), stroke=3)
         else:
             self._zoom_spoken = False
         if self.rec.recording and self.rec.record_start:
             el = int(time.time() - self.rec.record_start)
-            frame = draw_text_cn(frame, "● 录制中 %02d:%02d" % (el // 60, el % 60),
-                                 (16, 56), size=30, color=(0, 0, 255))
+            paste_label(frame, "● 录制中 %02d:%02d" % (el // 60, el % 60),
+                        (16, 56), size=30, color=(0, 0, 255))
             # 状态小药丸：红底闪烁圆点 + 录制时长和单号
             blink_on = int(time.time() * 2) % 2 == 0
             self.rec_pill.config(bg="#FEE2E2")
@@ -1227,10 +1487,17 @@ class App:
                 text="录制中 %02d:%02d · %s" % (el // 60, el % 60,
                                                self.rec.tracking_no),
                 bg="#FEE2E2", fg="#991B1B")
+            # 当前单号大字条 + 录制红框红顶栏
+            self.cur_no_label.config(text=self.rec.tracking_no)
+            self.cur_time_label.config(text="已录 %02d:%02d" % (el // 60, el % 60))
+            self._set_recording_chrome(True)
         else:
             self.rec_pill.config(bg="#E5E7EB")
             self.rec_dot.config(bg="#E5E7EB", fg="#9CA3AF")
             self.rec_label.config(text="待机", bg="#E5E7EB", fg="#4B5563")
+            self.cur_no_label.config(text="—")
+            self.cur_time_label.config(text="未在录制")
+            self._set_recording_chrome(False)
         # 缩放到正好铺满画面区（按画面区实际尺寸等比缩放，不撑出窗口）
         h, w = frame.shape[:2]
         lw = self.video_label.winfo_width()
@@ -1261,13 +1528,40 @@ class App:
                     text="磁盘 %.0fG · 可录 %.0f 小时" % (free_g, hours))
         except Exception:
             pass
+        # 磁盘满自动保护：录制中剩余空间低于阈值，先删最旧视频腾空间；
+        # 还不够就自动停录保存并提醒
+        try:
+            min_free = int(self.cfg.get("disk_min_free_mb") or 0)
+            if min_free > 0 and self.rec.recording:
+                d = self.cfg.get("save_dir") or ""
+                if d and os.path.isdir(d):
+                    free_mb = shutil.disk_usage(d).free / (1024 ** 2)
+                    if free_mb < min_free:
+                        self.rec._free_disk_space(min_free)
+                        free_mb = shutil.disk_usage(d).free / (1024 ** 2)
+                    if free_mb < min_free:
+                        path = self.rec.stop_recording(save=True)
+                        if path:
+                            self._on_saved(path)
+                        self._set_status(
+                            "磁盘空间不足（剩余 %.0fMB），已自动停止录制并保存。"
+                            % free_mb)
+        except Exception:
+            pass
+        # 今日已录侧栏每 10 秒刷新一次
+        try:
+            if time.time() - getattr(self, "_today_refresh_t", 0) >= 10:
+                self._today_refresh_t = time.time()
+                self._refresh_today()
+        except Exception:
+            pass
         try:
             fps = self.rec.loop_fps
             if fps > 0:
                 low = fps < 20
                 self.fps_label.config(
                     text="处理 %.0f 帧/秒%s" % (fps, "（偏低）" if low else ""),
-                    fg="#FCA5A5" if low else "#C7D2DE")
+                    fg="#DC2626" if low else self.C_MUTED)
         except Exception:
             pass
         self.root.after(2000, self._tick_disk)
@@ -1361,6 +1655,48 @@ class App:
         append_record(self._cur_no or "拍照", path, dur)
         self._cur_no = ""
         self._cur_start = None
+        self._refresh_today()
+
+    # ---------- 打开保存文件夹 / 今日已录侧栏 ----------
+    def _open_save_folder(self):
+        d = self.cfg.get("save_dir") or ""
+        if not d:
+            return
+        os.makedirs(d, exist_ok=True)
+        try:
+            if os.name == "nt":
+                os.startfile(d)
+            else:
+                os.system("xdg-open '%s' &" % d)
+        except Exception as ex:
+            self._set_status("打不开保存文件夹：%s" % ex)
+
+    def _refresh_today(self):
+        """刷新主界面右侧“今日已录”侧栏（只显示今天的，最多 12 条）。"""
+        try:
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            rows = [r for r in read_records()
+                    if r.get("time", "").startswith(today)]
+            for i in self.today_tree.get_children():
+                self.today_tree.delete(i)
+            for r in rows[:12]:
+                self.today_tree.insert("", tk.END, values=(
+                    r.get("time", "")[11:16], r.get("no", ""),
+                    r.get("dur", "")), tags=(r.get("path", ""),))
+            self.today_count_label.config(text="共 %d 单" % len(rows))
+        except Exception:
+            pass
+
+    def _open_today_video(self, _e=None):
+        sel = self.today_tree.selection()
+        if not sel:
+            return
+        path = self.today_tree.item(sel[0], "tags")[0]
+        if path and os.path.exists(path):
+            if os.name == "nt":
+                os.startfile(path)
+            else:
+                os.system("xdg-open '%s' &" % path)
 
     def _take_photo(self):
         no = clean_number(self.entry.get()) or "拍照"
@@ -1507,6 +1843,9 @@ class App:
         r = row(sec, "视频保留", "天，到期自动删，0 = 不删")
         days_var = tk.IntVar(value=int(cfg.get("save_days") or 40))
         spin(r, days_var, 0, 365)
+        r = row(sec, "磁盘保护", "MB：录制中剩余低于此值自动停录，0 = 关")
+        disk_var = tk.IntVar(value=int(cfg.get("disk_min_free_mb") or 500))
+        spin(r, disk_var, 0, 10000)
 
         # --- 录制 ---
         sec = section("录制")
@@ -1549,6 +1888,16 @@ class App:
         r = row(sec, "条码过滤", "正则，空 = 不过滤")
         filt_var = tk.StringVar(value=cfg.get("barcode_filter", ""))
         entry(r, filt_var, width=22)
+        r = row(sec, "视频编码", "H.264 文件约小一半；打不开自动回落")
+        codec_var = tk.StringVar(value=cfg.get("codec", "auto"))
+        ttk.Combobox(r, textvariable=codec_var,
+                     values=["auto", "h264", "mp4v"], width=8,
+                     state="readonly").pack(side=tk.LEFT)
+        tk.Label(r, text="auto=自动优先H.264", bg=self.C_CARD, fg=self.C_MUTED,
+                 font=self.F_SMALL).pack(side=tk.LEFT, padx=6)
+        r = row(sec, "断线重连", "秒：录制中断线超过此值自动停录保存，0 = 不停")
+        recon_var = tk.IntVar(value=int(cfg.get("reconnect_timeout") or 30))
+        spin(r, recon_var, 0, 300)
 
         # --- 其他 ---
         sec = section("其他")
@@ -1600,7 +1949,10 @@ class App:
             self.cfg["segment_seconds"] = int(seg_var.get())
             self.cfg["auto_stop_seconds"] = int(auto_var.get())
             self.cfg["save_days"] = int(days_var.get())
+            self.cfg["disk_min_free_mb"] = int(disk_var.get())
             self.cfg["barcode_filter"] = filt_var.get().strip()
+            self.cfg["codec"] = codec_var.get().strip() or "auto"
+            self.cfg["reconnect_timeout"] = int(recon_var.get())
             self.cfg["mirror"] = bool(mirror_v.get())
             self.cfg["auto_crop_black"] = bool(crop_v.get())
             self.cfg["mjpg"] = bool(mjpg_v.get())
@@ -1714,9 +2066,70 @@ class App:
         tree.bind("<Double-1>", open_file)
         bot = tk.Frame(win, bg=self.C_BG)
         bot.pack(fill=tk.X, padx=16, pady=(0, 12))
+        self._flat_btn(bot, "导出 Excel", self.C_GREEN, font=self.F_BIG,
+                       padx=20, pady=9, command=self._export_records).pack(side=tk.LEFT)
         self._flat_btn(bot, "▶  打开选中视频", self.C_BLUE, font=self.F_BIG,
                        padx=20, pady=9, command=open_file).pack(side=tk.RIGHT)
         refresh()
+
+    def _export_records(self):
+        """导出扫码记录为 Excel（没装 openpyxl 时提示改存 CSV）。"""
+        rows = read_records()
+        if not rows:
+            messagebox.showinfo("导出 Excel", "暂无扫码记录。")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx"), ("CSV 文件", "*.csv")],
+            initialfile="扫码记录_%s.xlsx"
+            % datetime.datetime.now().strftime("%Y%m%d"))
+        if not path:
+            return
+
+        def _size_mb(p):
+            try:
+                if p and os.path.exists(p):
+                    return round(os.path.getsize(p) / (1024 ** 2), 2)
+            except Exception:
+                pass
+            return ""
+
+        header = ["单号", "扫码时间", "时长（秒）", "文件", "大小（MB）"]
+        data = [[r.get("no", ""), r.get("time", ""), r.get("dur", ""),
+                 r.get("file", ""), _size_mb(r.get("path", ""))]
+                for r in rows]
+        if path.lower().endswith(".csv"):
+            import csv
+            try:
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(header)
+                    w.writerows(data)
+            except Exception as ex:
+                messagebox.showerror("导出失败", "导出失败：%s" % ex)
+                return
+        else:
+            try:
+                from openpyxl import Workbook
+            except ImportError:
+                messagebox.showinfo(
+                    "导出 Excel",
+                    "本机未安装 openpyxl（pip install openpyxl），"
+                    "请改选保存为 CSV 格式。")
+                return
+            try:
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "扫码记录"
+                ws.append(header)
+                for row in data:
+                    ws.append(row)
+                wb.save(path)
+            except Exception as ex:
+                messagebox.showerror("导出失败", "导出失败：%s" % ex)
+                return
+        self._set_status("已导出 %d 条扫码记录：%s"
+                         % (len(rows), os.path.basename(path)))
 
     # ---------- 扫码枪全局监听（可选） ----------
     def _start_global_listener(self):

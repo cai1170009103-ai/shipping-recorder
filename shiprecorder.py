@@ -51,7 +51,7 @@ DEFAULT_CONFIG = {
     "font_size": 30,
     # 下面是按 MFEC 设置页对齐的功能
     "pre_roll_seconds": 5,    # 前置预录制：扫码前 N 秒画面也存进视频
-    "zoom_after_scan": {"enabled": True, "delay": 2, "duration": 3},
+    "zoom_after_scan": {"enabled": True, "delay": 2, "duration": 3, "factor": 2.0},
     "voice_prompt": True,     # 扫码后放大时语音播报（Windows 自带语音，无需联网）
     "voice_text": "凯博好帅",   # 语音播报的文字（设置里可改）
     "max_record_seconds": 200,  # 单段最长录制秒数，到时自动保存
@@ -666,10 +666,20 @@ class Recorder:
         cv2.imwrite(path, frame)
         return True, path
 
+    def zoom_factor(self):
+        """放大倍数：设置里可调（默认 2 倍）。"""
+        try:
+            f = float((self.cfg.get("zoom_after_scan") or {}).get("factor", 2.0))
+        except Exception:
+            f = 2.0
+        return min(4.0, max(1.0, f))
+
     def guide_rect(self):
-        """取景框：画面中央 55% 的矩形，也是放大时裁切的区域。"""
+        """取景框：画面中央的矩形，也是放大时裁切的区域。
+        边长 = 画面边长 / 放大倍数，倍数越大框越小、放得越大。"""
         w, h = self.frame_size
-        gw, gh = int(w * 0.55), int(h * 0.55)
+        f = self.zoom_factor()
+        gw, gh = max(1, int(w / f)), max(1, int(h / f))
         x1, y1 = (w - gw) // 2, (h - gh) // 2
         return (x1, y1, x1 + gw, y1 + gh)
 
@@ -1015,6 +1025,8 @@ class App:
         head_btn("设置", self._open_settings).pack(side=tk.RIGHT, padx=4)
         head_btn("扫码记录", self._open_records).pack(side=tk.RIGHT, padx=4)
         head_btn("拍照", self._take_photo).pack(side=tk.RIGHT, padx=4)
+        self.fs_btn = head_btn("全屏", self._toggle_fullscreen)
+        self.fs_btn.pack(side=tk.RIGHT, padx=4)
 
         # ===== 模式行（分段选择器）=====
         mode_row = tk.Frame(self.root, bg=BG)
@@ -1045,6 +1057,12 @@ class App:
         video_wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
         self.video_label = tk.Label(video_wrap, bg="black")
         self.video_label.pack(fill=tk.BOTH, expand=True)
+        # 固定一个小的期望尺寸：让 pack 按剩余空间分配画面区，而不是按
+        # 预览图的大小撑高窗口，否则最大化/全屏时底部状态栏会被顶出屏幕。
+        self.video_label.config(width=640, height=360)
+        self.video_label.bind("<Double-Button-1>",
+                              lambda e: self._toggle_fullscreen())
+        self.root.bind("<Escape>", lambda e: self._set_fullscreen(False))
 
         # ===== 底部操作卡片 =====
         bottom = tk.Frame(self.root, bg=self.C_CARD,
@@ -1084,6 +1102,25 @@ class App:
         self.status_label.pack(side=tk.LEFT)
         tk.Label(status_bar, text="免费版 · 视频按单号命名保存",
                  bg=BG, fg="#9CA3AF", font=self.F_SMALL).pack(side=tk.RIGHT)
+
+    def _set_fullscreen(self, on):
+        """全屏开关：铺满整个屏幕，顶栏、扫码区、底部状态栏都还在，
+        画面区跟着变大。Esc 或再点“退出全屏”或双击画面都能退出。"""
+        try:
+            self.root.attributes("-fullscreen", bool(on))
+        except Exception:
+            pass
+        try:
+            self.fs_btn.config(text="退出全屏" if on else "全屏")
+        except Exception:
+            pass
+
+    def _toggle_fullscreen(self, event=None):
+        try:
+            cur = bool(self.root.attributes("-fullscreen"))
+        except Exception:
+            cur = False
+        self._set_fullscreen(not cur)
 
     def _restyle_mode_btns(self):
         cur = self.mode_var.get()
@@ -1473,7 +1510,13 @@ class App:
                  font=self.F_BODY).pack(side=tk.LEFT, padx=2)
         zt_var = tk.IntVar(value=int(zoom.get("duration", 3)))
         spin(r, zt_var, 1, 10, width=4)
-        tk.Label(r, text="秒", bg=self.C_CARD, fg=self.C_TEXT,
+        tk.Label(r, text="秒，", bg=self.C_CARD, fg=self.C_TEXT,
+                 font=self.F_BODY).pack(side=tk.LEFT, padx=2)
+        zf_var = tk.StringVar(value=str(zoom.get("factor", 2.0)))
+        ttk.Combobox(r, textvariable=zf_var,
+                     values=["1.5", "2", "2.5", "3", "4"], width=4,
+                     state="readonly").pack(side=tk.LEFT)
+        tk.Label(r, text="倍", bg=self.C_CARD, fg=self.C_TEXT,
                  font=self.F_BODY).pack(side=tk.LEFT, padx=2)
         r = row(sec, "语音播报", "放大时读下面的话")
         voice_v = tk.BooleanVar(value=bool(cfg.get("voice_prompt", True)))
@@ -1529,9 +1572,14 @@ class App:
             self.cfg["save_dir"] = dir_var.get().strip() or self.cfg["save_dir"]
             self.cfg["terminal_id"] = tid_var.get().strip() or "10001"
             self.cfg["pre_roll_seconds"] = int(pre_var.get())
+            try:
+                zf = float(zf_var.get())
+            except Exception:
+                zf = 2.0
             self.cfg["zoom_after_scan"] = {"enabled": bool(zoom_var.get()),
                                            "delay": int(zd_var.get()),
-                                           "duration": int(zt_var.get())}
+                                           "duration": int(zt_var.get()),
+                                           "factor": min(4.0, max(1.0, zf))}
             self.cfg["voice_prompt"] = bool(voice_v.get())
             self.cfg["voice_text"] = voice_t.get().strip() or "凯博好帅"
             self.cfg["max_record_seconds"] = int(max_var.get())

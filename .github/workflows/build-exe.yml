@@ -30,13 +30,12 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0
-          name: 发货录制终端 v1.0
+          tag_name: v1.1
+          name: 发货录制终端 v1.1
           body: |
-            发货录制终端 v1.0（MFEC 录制终端免费平替）
+            发货录制终端 v1.1（MFEC 录制终端免费平替）
             下载下面的 exe，双击就能用，不用装 Python。
             摄像头、扫码枪、保存文件夹等在软件右上角“设置”里调。
+            v1.1 修复：设置（摄像头/终端号/保存文件夹）现在能记住了，
+            重开软件不用再选摄像头；自动裁掉某些摄像头驱动造成的画面黑边。
           files: dist/*.exe
-
-
-

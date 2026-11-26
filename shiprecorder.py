@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-发货录制终端 v1.0 —— 免费自用版
+发货录制终端 v1.1 —— 免费自用版
 功能：摄像头取景 + 扫码单号触发录制 + 时间戳/单号水印烧进视频 + 按单号命名保存 + 今日计数
 用法：双击 run.bat 启动；把摄像头架在打包台正上方，扫码枪扫快递单号后开始录制，
      打包完成后点“停止”或直接扫下一单（自动保存上一段并开始新一段）。
@@ -22,8 +22,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "发货录制终端"
-VERSION = "v1.0"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VERSION = "v1.1"
+if getattr(sys, "frozen", False):
+    # PyInstaller onefile 打包后：__file__ 指向每次启动都重建的临时解压目录，
+    # 配置写在那里，关掉软件就没了，下次启动又得重选摄像头。
+    # 打包版改放 exe 所在目录，设置才能记住。
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 COUNT_PATH = os.path.join(BASE_DIR, "count.json")
 
@@ -37,6 +43,7 @@ DEFAULT_CONFIG = {
     "mode": "打包发货",          # 打包发货 / 进出库管理 / 退件拆包
     "mirror": False,
     "guide_box": True,
+    "auto_crop_black": True,  # 自动裁黑边：某些摄像头驱动会把画面只放在帧的一半，另一半留黑
     "motion_box": False,
     "auto_stop_seconds": 0,   # 0 = 不自动停；>0 时无动作 N 秒后自动停止并保存
     "font_size": 30,
@@ -282,6 +289,32 @@ def list_cameras(max_index=5):
     return found
 
 
+def detect_black_borders(frame, thresh=12):
+    """检测画面四周整条纯黑边：某些摄像头驱动会把实际画面只放在帧的一半，
+    另一半留黑（画面看起来只有右边一小块）。返回 (x1, y1, x2, y2) 裁切区；
+    没有黑边返回 None。只认接近纯黑（平均亮度 < thresh）的整条边，
+    打包台上正常偏暗的画面不会误裁。"""
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        return None
+    h, w = gray.shape
+    col = gray.mean(axis=0)  # 每列平均亮度
+    row = gray.mean(axis=1)  # 每行平均亮度
+    xs = np.where(col > thresh)[0]
+    ys = np.where(row > thresh)[0]
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    x1, x2 = int(xs[0]), int(xs[-1]) + 1
+    y1, y2 = int(ys[0]), int(ys[-1]) + 1
+    # 黑边太小不裁；裁完剩下的画面不能太小（防误判）
+    if x1 < w * 0.03 and x2 > w * 0.97 and y1 < h * 0.03 and y2 > h * 0.97:
+        return None
+    if (x2 - x1) < w * 0.4 or (y2 - y1) < h * 0.4:
+        return None
+    return (x1, y1, x2, y2)
+
+
 # ---------------- 录制核心（采集线程） ----------------
 class Recorder:
     def __init__(self, cfg, on_frame, on_status):
@@ -296,6 +329,8 @@ class Recorder:
         self.record_start = None
         self.last_motion = None
         self.frame_size = (cfg["width"], cfg["height"])
+        self._native_size = self.frame_size  # 摄像头实际出帧尺寸（以读到的帧为准）
+        self._crop_rect = None              # 黑边裁切区 (x1, y1, x2, y2)，无黑边为 None
         self.fps = cfg["fps"]
         self._stop_event = threading.Event()
         self._thread = None
@@ -338,8 +373,33 @@ class Recorder:
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or self.cfg["width"]
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or self.cfg["height"]
         fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.frame_size = (w, h)
         self.fps = fps if fps and fps > 0 else self.cfg["fps"]
+        # 实际出帧尺寸以读到的帧为准：有些摄像头驱动上报的尺寸和实际帧不符。
+        # 顺便用前几帧测黑边（画面只占帧的一半、另一半留黑的驱动毛病），
+        # 测到就裁掉，预览和录像都只保留有画面的部分。
+        self._native_size = (w, h)
+        self._crop_rect = None
+        try:
+            probes = []
+            for _ in range(3):
+                ok, pf = self.cap.read()
+                if ok and pf is not None:
+                    probes.append(pf)
+            if probes:
+                self._native_size = (probes[0].shape[1], probes[0].shape[0])
+                if self.cfg.get("auto_crop_black", True):
+                    avg = np.mean(
+                        [cv2.cvtColor(p, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                         for p in probes], axis=0).astype(np.uint8)
+                    bgr_avg = cv2.cvtColor(avg, cv2.COLOR_GRAY2BGR)
+                    self._crop_rect = detect_black_borders(bgr_avg)
+        except Exception:
+            pass
+        if self._crop_rect:
+            x1, y1, x2, y2 = self._crop_rect
+            self.frame_size = (x2 - x1, y2 - y1)
+        else:
+            self.frame_size = self._native_size
         # 前置预录制缓冲：按帧率算出要缓存的帧数
         pre = float(self.cfg.get("pre_roll_seconds") or 0)
         self._preroll = deque(maxlen=int(self.fps * pre)) if pre > 0 else None
@@ -582,8 +642,12 @@ class Recorder:
                 self.on_status("摄像头断开了：请重新插拔摄像头后点“重连摄像头”。")
                 time.sleep(0.5)
                 continue
-            if frame.shape[1] != self.frame_size[0] or frame.shape[0] != self.frame_size[1]:
-                frame = cv2.resize(frame, self.frame_size)
+            if frame.shape[1] != self._native_size[0] or frame.shape[0] != self._native_size[1]:
+                frame = cv2.resize(frame, self._native_size)
+            if self._crop_rect:
+                # 驱动黑边：只保留有画面的部分（预览和录像都按裁后的尺寸走）
+                x1, y1, x2, y2 = self._crop_rect
+                frame = frame[y1:y2, x1:x2]
             if self.cfg.get("mirror"):
                 frame = cv2.flip(frame, 1)
             # 扫码后放大：先裁切再烧水印，放大期间时间戳和单号也不会丢
@@ -836,7 +900,7 @@ class App:
                  width=2, height=1).pack(side=tk.LEFT, padx=(14, 10), pady=10)
         tk.Label(top, text="发货录制终端", bg=HEAD, fg="white",
                  font=self.F_TITLE).pack(side=tk.LEFT)
-        tk.Label(top, text="v1.0", bg=HEAD, fg="#8FA3B8",
+        tk.Label(top, text=VERSION, bg=HEAD, fg="#8FA3B8",
                  font=self.F_SMALL).pack(side=tk.LEFT, padx=(6, 0), pady=(6, 0))
         # 终端号小标签
         tk.Label(top, text="终端 %s" % self.cfg.get("terminal_id", ""),
@@ -1347,6 +1411,8 @@ class App:
         r = row(sec, "画面")
         mirror_v = tk.BooleanVar(value=bool(cfg.get("mirror")))
         check(r, "镜像", mirror_v).pack(side=tk.LEFT)
+        crop_v = tk.BooleanVar(value=bool(cfg.get("auto_crop_black", True)))
+        check(r, "自动裁黑边", crop_v).pack(side=tk.LEFT, padx=10)
         guide_v = tk.BooleanVar(value=bool(cfg.get("guide_box")))
         check(r, "取景框", guide_v).pack(side=tk.LEFT, padx=10)
         motion_v = tk.BooleanVar(value=bool(cfg.get("motion_box")))
@@ -1387,6 +1453,7 @@ class App:
             self.cfg["save_days"] = int(days_var.get())
             self.cfg["barcode_filter"] = filt_var.get().strip()
             self.cfg["mirror"] = bool(mirror_v.get())
+            self.cfg["auto_crop_black"] = bool(crop_v.get())
             self.cfg["guide_box"] = bool(guide_v.get())
             self.cfg["motion_box"] = bool(motion_v.get())
             self.cfg["photo_only"] = bool(photo_v.get())

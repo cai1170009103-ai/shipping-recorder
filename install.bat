@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-title 发货录制终端 - 安装
+title 凯博助手 - 安装
 cd /d %~dp0
 
 echo ============================================
-echo  发货录制终端 v1.2 安装
+echo  凯博助手 v1.2 安装
 echo  1) 检查 Python
 echo  2) 创建虚拟环境并安装依赖
 echo  3) 在桌面创建快捷方式
@@ -44,14 +44,14 @@ if %errorlevel% neq 0 (
 
 echo 正在创建桌面快捷方式 ...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\发货录制终端.lnk');" ^
+  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\凯博助手.lnk');" ^
   "$s.TargetPath='%~dp0run.bat';" ^
   "$s.WorkingDirectory='%~dp0';" ^
-  "$s.Description='发货录制终端';" ^
+  "$s.Description='凯博助手';" ^
   "$s.Save()"
 
 echo.
-echo 安装完成！双击桌面的“发货录制终端”就能用。
+echo 安装完成！双击桌面的“凯博助手”就能用。
 echo 第一次打开：点“设置”选好摄像头、分辨率、保存文件夹。
 echo.
 pause

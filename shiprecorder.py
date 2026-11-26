@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-发货录制终端 v1.2 —— 免费自用版
+凯博助手 v1.2 —— 免费自用版
 功能：摄像头取景 + 扫码单号触发录制 + 时间戳/单号水印烧进视频 + 按单号命名保存 + 今日计数
 用法：双击 run.bat 启动；把摄像头架在打包台正上方，扫码枪扫快递单号后开始录制，
      打包完成后点“停止”或直接扫下一单（自动保存上一段并开始新一段）。
@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-APP_NAME = "发货录制终端"
+APP_NAME = "凯博助手"
 VERSION = "v1.2"
 if getattr(sys, "frozen", False):
     # PyInstaller onefile 打包后：__file__ 指向每次启动都重建的临时解压目录，
@@ -925,6 +925,20 @@ class App:
         self.selftest = selftest
         self.count = load_count()
         self.root.title("%s %s" % (APP_NAME, VERSION))
+        # 窗口图标：打包版从 _MEIPASS（随 exe 打包的 kaibo.ico），
+        # 源码运行从软件目录找；找不到就用默认图标，不报错。
+        try:
+            _ip = None
+            for _base in (getattr(sys, "_MEIPASS", None), BASE_DIR):
+                if _base:
+                    _p = os.path.join(_base, "kaibo.ico")
+                    if os.path.exists(_p):
+                        _ip = _p
+                        break
+            if _ip:
+                self.root.iconbitmap(_ip)
+        except Exception:
+            pass
         self.root.geometry("1160x840")
         self._frame_queue = queue.Queue(maxsize=2)
         self._status_queue = queue.Queue()
@@ -992,7 +1006,7 @@ class App:
         tk.Label(top, text="录", bg=self.C_GREEN, fg="white",
                  font=("Microsoft YaHei", 15, "bold"),
                  width=2, height=1).pack(side=tk.LEFT, padx=(14, 10), pady=10)
-        tk.Label(top, text="发货录制终端", bg=HEAD, fg="white",
+        tk.Label(top, text="凯博助手", bg=HEAD, fg="white",
                  font=self.F_TITLE).pack(side=tk.LEFT)
         tk.Label(top, text=VERSION, bg=HEAD, fg="#8FA3B8",
                  font=self.F_SMALL).pack(side=tk.LEFT, padx=(6, 0), pady=(6, 0))

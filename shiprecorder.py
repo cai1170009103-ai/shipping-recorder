@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-发货录制终端 v1.1 —— 免费自用版
+发货录制终端 v1.2 —— 免费自用版
 功能：摄像头取景 + 扫码单号触发录制 + 时间戳/单号水印烧进视频 + 按单号命名保存 + 今日计数
 用法：双击 run.bat 启动；把摄像头架在打包台正上方，扫码枪扫快递单号后开始录制，
      打包完成后点“停止”或直接扫下一单（自动保存上一段并开始新一段）。
@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "发货录制终端"
-VERSION = "v1.1"
+VERSION = "v1.2"
 if getattr(sys, "frozen", False):
     # PyInstaller onefile 打包后：__file__ 指向每次启动都重建的临时解压目录，
     # 配置写在那里，关掉软件就没了，下次启动又得重选摄像头。
@@ -38,6 +38,8 @@ DEFAULT_CONFIG = {
     "width": 1920,
     "height": 1080,
     "fps": 30,
+    "mjpg": True,   # MJPG 模式：走压缩格式，省 USB 带宽；很多 4K 摄像头默认 YUY2
+                    # 不压缩，1080p 就占满 USB 2.0 带宽，出帧只剩几帧/秒
     "save_dir": os.path.join(BASE_DIR, "videos"),
     "terminal_id": "10001",
     "mode": "打包发货",          # 打包发货 / 进出库管理 / 退件拆包
@@ -412,16 +414,39 @@ class Recorder:
             self.cap = cv2.VideoCapture(self.test_video)
         else:
             flag = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-            self.cap = cv2.VideoCapture(self.cfg["camera_index"], flag)
-            try:
-                if int(self.cfg.get("width") or 0) > 0:
-                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg["width"])
-                if int(self.cfg.get("height") or 0) > 0:
-                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg["height"])
-                if int(self.cfg.get("fps") or 0) > 0:
-                    self.cap.set(cv2.CAP_PROP_FPS, self.cfg["fps"])
-            except Exception:
-                pass
+            # MJPG 优先：很多 4K 摄像头默认走不压缩的 YUY2，1080p 就要占满
+            # USB 2.0 带宽，出帧只剩几帧/秒；MJPG 只要约 1/20 带宽就能跑满 30 帧。
+            # MJPG 不支持的摄像头探不到帧，自动重开一次（不设 MJPG）。
+            attempts = [True, False] if self.cfg.get("mjpg", True) else [False]
+            self.cap = None
+            for use_mjpg in attempts:
+                cap = cv2.VideoCapture(self.cfg["camera_index"], flag)
+                try:
+                    if use_mjpg:
+                        cap.set(cv2.CAP_PROP_FOURCC,
+                                cv2.VideoWriter_fourcc(*"MJPG"))
+                    if int(self.cfg.get("width") or 0) > 0:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg["width"])
+                    if int(self.cfg.get("height") or 0) > 0:
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg["height"])
+                    if int(self.cfg.get("fps") or 0) > 0:
+                        cap.set(cv2.CAP_PROP_FPS, self.cfg["fps"])
+                except Exception:
+                    pass
+                if not cap.isOpened():
+                    cap.release()
+                    continue
+                ok = False
+                for _ in range(3):
+                    ok, _pf = cap.read()
+                    if ok:
+                        break
+                if ok:
+                    self.cap = cap
+                    break
+                cap.release()
+            if self.cap is None:
+                return False
         if not self.cap.isOpened():
             return False
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or self.cfg["width"]
@@ -1411,6 +1436,9 @@ class App:
         res_var = tk.StringVar(value=cur_res if cur_res in RESOLUTIONS else "1920x1080")
         ttk.Combobox(r, textvariable=res_var, values=RESOLUTIONS, width=13,
                      state="readonly").pack(side=tk.LEFT)
+        r = row(sec, "MJPG 模式", "帧数低时开：走压缩格式，省 USB 带宽")
+        mjpg_v = tk.BooleanVar(value=bool(cfg.get("mjpg", True)))
+        check(r, "启用", mjpg_v).pack(side=tk.LEFT)
 
         # --- 保存 ---
         sec = section("保存")
@@ -1513,6 +1541,7 @@ class App:
             self.cfg["barcode_filter"] = filt_var.get().strip()
             self.cfg["mirror"] = bool(mirror_v.get())
             self.cfg["auto_crop_black"] = bool(crop_v.get())
+            self.cfg["mjpg"] = bool(mjpg_v.get())
             self.cfg["guide_box"] = bool(guide_v.get())
             self.cfg["motion_box"] = bool(motion_v.get())
             self.cfg["photo_only"] = bool(photo_v.get())

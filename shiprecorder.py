@@ -94,12 +94,18 @@ def _play_mp3_windows(path):
         return False
 
 
-def _speak_edge(text):
-    """Edge 在线甜美女声（晓晓）。返回 True 表示播报成功。"""
+def _voice_cache_path(text):
+    """播报语音缓存文件：按文字算 md5，存在 exe 旁边，启动时提前合成好，
+    扫码时直接放缓存，不用每次都等联网合成。"""
+    import hashlib
+    key = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(BASE_DIR, "voice_%s.mp3" % key)
+
+
+def _edge_synthesize(text, out_path):
+    """Edge 在线合成 mp3 存到 out_path。成功返回 True。"""
     try:
         import asyncio
-        import os
-        import tempfile
         import edge_tts
 
         async def _gen(path):
@@ -107,20 +113,67 @@ def _speak_edge(text):
                 text, "zh-CN-XiaoxiaoNeural", rate="+10%")
             await asyncio.wait_for(communicate.save(path), timeout=10)
 
-        fd, path = tempfile.mkstemp(suffix=".mp3")
-        os.close(fd)
-        try:
-            asyncio.run(_gen(path))
-            if not _play_mp3_windows(path):
-                return False
-        finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-        return True
+        asyncio.run(_gen(out_path))
+        return os.path.isfile(out_path) and os.path.getsize(out_path) > 1024
     except Exception:
         return False
+
+
+def _speak_edge(text):
+    """Edge 在线甜美女声（晓晓）。返回 True 表示播报成功。
+    先放缓存（启动时已提前合成好），没有缓存才现合成并存下来再放。"""
+    cache = _voice_cache_path(text)
+    try:
+        if os.path.isfile(cache) and os.path.getsize(cache) > 1024:
+            if _play_mp3_windows(cache):
+                return True
+    except Exception:
+        pass
+    try:
+        # 合成到缓存同目录的临时文件再改名：和缓存同一磁盘，改名一定成功
+        # （用系统临时目录的话，跨盘改名会失败，缓存就存不下来）
+        tmp = cache + ".tmp"
+        try:
+            if _edge_synthesize(text, tmp):
+                try:
+                    os.replace(tmp, cache)
+                except Exception:
+                    pass
+                play_path = cache if os.path.isfile(cache) else tmp
+                return _play_mp3_windows(play_path)
+        finally:
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def presynth_voice(text):
+    """后台提前把播报语音合成好存进缓存：扫码时直接放缓存，秒播报，
+    不用等联网合成。启动时调一次，改了播报文字后也调一次。"""
+    def _run():
+        try:
+            cache = _voice_cache_path(text)
+            if os.path.isfile(cache) and os.path.getsize(cache) > 1024:
+                return
+            tmp = cache + ".tmp"
+            if _edge_synthesize(text, tmp):
+                try:
+                    os.replace(tmp, cache)
+                except Exception:
+                    pass
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _speak_sapi(text):
@@ -174,7 +227,8 @@ def _speak_sapi(text):
 
 def speak(text):
     """语音播报：优先 Edge 甜美女声，失败回落 Windows 自带语音。
-    后台线程发声，绝不阻塞界面和录制；全部失败就静默跳过。"""
+    后台线程发声，绝不阻塞界面和录制；全部失败就静默跳过。
+    _speak_edge 先放启动时预合成好的缓存（秒出声），没有缓存才现合成。"""
     def _run():
         if _speak_edge(text):
             return
@@ -852,6 +906,11 @@ class App:
         self._auto_cleanup()
         self._start_global_listener()
         self._start_camera()
+        # 启动时后台提前合成播报语音存缓存，扫码时直接放，不用等联网合成
+        try:
+            presynth_voice(self.cfg.get("voice_text", "凯博好帅") or "凯博好帅")
+        except Exception:
+            pass
         self._update_preview()
         self._tick_disk()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1459,6 +1518,11 @@ class App:
             self.cfg["photo_only"] = bool(photo_v.get())
             self.cfg["global_scan"] = bool(glob_v.get())
             save_config(self.cfg)
+            # 播报文字改了就重新提前合成一份缓存
+            try:
+                presynth_voice(self.cfg.get("voice_text", "凯博好帅") or "凯博好帅")
+            except Exception:
+                pass
             self.mirror_var.set(self.cfg["mirror"])
             # 摄像头或分辨率变了就重开摄像头
             self.rec.stop()

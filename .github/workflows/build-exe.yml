@@ -25,15 +25,16 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe
-        run: pyinstaller --noconfirm --onefile --windowed --name "发货录制终端" shiprecorder.py
+        run: pyinstaller --noconfirm --onefile --windowed --name "凯博助手" --icon kaibo.ico --add-data "kaibo.ico;." shiprecorder.py
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.2
-          name: 发货录制终端 v1.2
+          name: 凯博助手 v1.2
           body: |
-            发货录制终端 v1.2（MFEC 录制终端免费平替）
+            凯博助手 v1.2（MFEC 录制终端免费平替）
+            改名凯博助手，换了战甲风新图标（透明底）。
             下载下面的 exe，双击就能用，不用装 Python。
             摄像头、扫码枪、保存文件夹等在软件右上角“设置”里调。
             v1.2 修复：默认开 MJPG 模式，摄像头走压缩格式、省 USB 带宽，

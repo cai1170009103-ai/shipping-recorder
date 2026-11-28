@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-凯博助手 v1.3 —— 免费自用版
+凯博助手 v1.4 —— 免费自用版
 功能：摄像头取景 + 扫码单号触发录制 + 时间戳/单号水印烧进视频 + 按单号命名保存 + 今日计数
 用法：双击 run.bat 启动；把摄像头架在打包台正上方，扫码枪扫快递单号后开始录制，
      打包完成后点“停止”或直接扫下一单（自动保存上一段并开始新一段）。
@@ -12,6 +12,7 @@ import sys
 import json
 import time
 import queue
+import struct
 import threading
 import datetime
 import re
@@ -22,7 +23,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "凯博助手"
-VERSION = "v1.3"
+VERSION = "v1.4"
 if getattr(sys, "frozen", False):
     # PyInstaller onefile 打包后：__file__ 指向每次启动都重建的临时解压目录，
     # 配置写在那里，关掉软件就没了，下次启动又得重选摄像头。
@@ -63,6 +64,7 @@ DEFAULT_CONFIG = {
     "codec": "auto",          # 视频编码：auto（优先 H.264，打不开回落 mp4v）/ h264 / mp4v
     "disk_min_free_mb": 500,  # 磁盘保护：录制中剩余空间低于此值（MB）自动停录保存，0 = 关
     "reconnect_timeout": 30,  # 断线重连：录制中断线超过此值（秒）自动停录保存，0 = 不停
+    "sidebar_collapsed": False,  # 今日已录侧栏默认展开；收起后下次打开保持收起
 }
 
 
@@ -440,8 +442,14 @@ class Recorder:
         self.test_video = None        # 测试用：用视频文件代替摄像头
         self.latest_frame = None
         self._preroll = None          # 前置预录制环形缓冲
+        self._pending_preroll = None  # 待写入的预录制帧：start_recording 只存不写，_loop 写
         self._zoom_from = None
         self._zoom_until = None
+        self._zoom_buf = None         # 放大复用缓冲：尺寸变了才重分，避免每帧新分 4K 大图
+        self._cam_fourcc = ""         # 回读到的摄像头实际格式，如 MJPG / YUY2
+        self._cam_mjpg_ok = False     # 回读确认是 MJPG 才为真
+        self._cam_fps_measured = 0.0  # 开摄像头时实测的出帧帧率
+        self._mjpg_warned = False     # MJPG 未生效的提示只显示一次（重连成功 MJPG 后复位）
         self._segment_start = None
         self._part_index = 1
         self._current_path = ""
@@ -458,6 +466,21 @@ class Recorder:
         self._run_id = 0              # 采集线程代号：防旧线程在重开摄像头后继续跑
         self._disk_check_t = 0
 
+    @staticmethod
+    def _read_fourcc(cap):
+        """回读摄像头实际像素格式（如 MJPG / YUY2），读不到返回 ""。
+        DirectShow 下 set FOURCC 可能被驱动悄悄忽略，不回读就发现不了。"""
+        try:
+            v = int(cap.get(cv2.CAP_PROP_FOURCC))
+            if v > 0:
+                s = struct.pack("<I", v & 0xFFFFFFFF).decode(
+                    "ascii", "ignore").strip("\x00").strip()
+                if s:
+                    return s
+        except Exception:
+            pass
+        return ""
+
     def open_camera(self):
         # 先放掉旧的摄像头句柄（重连/重开时不留泄漏，否则新开可能失败）
         if self.cap is not None:
@@ -466,27 +489,48 @@ class Recorder:
             except Exception:
                 pass
             self.cap = None
+        self._cam_fourcc = ""
+        self._cam_mjpg_ok = False
         if self.test_video:
             self.cap = cv2.VideoCapture(self.test_video)
+            self._cam_fourcc = self._read_fourcc(self.cap)
         else:
             flag = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
             # MJPG 优先：很多 4K 摄像头默认走不压缩的 YUY2，1080p 就要占满
             # USB 2.0 带宽，出帧只剩几帧/秒；MJPG 只要约 1/20 带宽就能跑满 30 帧。
-            # MJPG 不支持的摄像头探不到帧，自动重开一次（不设 MJPG）。
-            attempts = [True, False] if self.cfg.get("mjpg", True) else [False]
+            # 三档顺序都试一遍，每档回读 FOURCC 确认，MJPG 档只有回读是 MJPG
+            # 才算成功（有些驱动只认“先分辨率再 MJPG”的顺序）：
+            #   (a) 先 MJPG 再分辨率；(b) 先分辨率再 MJPG；(c) 不设 MJPG。
+            if self.cfg.get("mjpg", True):
+                attempts = [("mjpg_first", True), ("res_first", True),
+                            ("none", False)]
+            else:
+                attempts = [("none", False)]
+
+            def _set_res(_cap):
+                if int(self.cfg.get("width") or 0) > 0:
+                    _cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg["width"])
+                if int(self.cfg.get("height") or 0) > 0:
+                    _cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg["height"])
+                if int(self.cfg.get("fps") or 0) > 0:
+                    _cap.set(cv2.CAP_PROP_FPS, self.cfg["fps"])
+
             self.cap = None
-            for use_mjpg in attempts:
+            for order, use_mjpg in attempts:
                 cap = cv2.VideoCapture(self.cfg["camera_index"], flag)
                 try:
-                    if use_mjpg:
-                        cap.set(cv2.CAP_PROP_FOURCC,
-                                cv2.VideoWriter_fourcc(*"MJPG"))
-                    if int(self.cfg.get("width") or 0) > 0:
-                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg["width"])
-                    if int(self.cfg.get("height") or 0) > 0:
-                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg["height"])
-                    if int(self.cfg.get("fps") or 0) > 0:
-                        cap.set(cv2.CAP_PROP_FPS, self.cfg["fps"])
+                    if order == "mjpg_first":
+                        if use_mjpg:
+                            cap.set(cv2.CAP_PROP_FOURCC,
+                                    cv2.VideoWriter_fourcc(*"MJPG"))
+                        _set_res(cap)
+                    elif order == "res_first":
+                        _set_res(cap)
+                        if use_mjpg:
+                            cap.set(cv2.CAP_PROP_FOURCC,
+                                    cv2.VideoWriter_fourcc(*"MJPG"))
+                    else:
+                        _set_res(cap)
                 except Exception:
                     pass
                 if not cap.isOpened():
@@ -497,10 +541,18 @@ class Recorder:
                     ok, _pf = cap.read()
                     if ok:
                         break
-                if ok:
-                    self.cap = cap
-                    break
-                cap.release()
+                if not ok:
+                    cap.release()
+                    continue
+                fourcc = self._read_fourcc(cap)
+                if use_mjpg and fourcc != "MJPG":
+                    # 驱动没吃下 MJPG：这档不算，换下一档顺序再试
+                    cap.release()
+                    continue
+                self.cap = cap
+                self._cam_fourcc = fourcc
+                self._cam_mjpg_ok = (fourcc == "MJPG")
+                break
             if self.cap is None:
                 return False
         if not self.cap.isOpened():
@@ -509,6 +561,36 @@ class Recorder:
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or self.cfg["height"]
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.fps = fps if fps and fps > 0 else self.cfg["fps"]
+        # 实测出帧帧率：连续读几帧计时（视频文件不测，文件读多快都不代表摄像头）
+        self._cam_fps_measured = 0.0
+        if not self.test_video:
+            try:
+                n = 0
+                t0 = time.time()
+                while n < 8 and time.time() - t0 < 1.5:
+                    ok, _pf = self.cap.read()
+                    if not ok:
+                        break
+                    n += 1
+                dt = time.time() - t0
+                if n >= 2 and dt > 0:
+                    self._cam_fps_measured = n / dt
+            except Exception:
+                pass
+        # 开了 MJPG 但回读不是 MJPG：提示一次（不是每重连一次就刷一次）；
+        # 一旦某次重连确认拿到 MJPG 就复位，下次再丢 MJPG 还会再提示。
+        if not self.test_video and self.cfg.get("mjpg", True) \
+                and not self._cam_mjpg_ok:
+            if not self._mjpg_warned:
+                self._mjpg_warned = True
+                fmt = self._cam_fourcc or "未知"
+                extra = ("，实测出帧约 %.0f 帧/秒" % self._cam_fps_measured
+                         if self._cam_fps_measured > 0 else "")
+                self.on_status("提示：摄像头没有走 MJPG 压缩（实际 %s%s），"
+                               "1080p 可能会不流畅，4K 反而流畅。"
+                               % (fmt, extra))
+        else:
+            self._mjpg_warned = False
         # 实际出帧尺寸以读到的帧为准：有些摄像头驱动上报的尺寸和实际帧不符。
         # 顺便用前几帧测黑边（画面只占帧的一半、另一半留黑的驱动毛病），
         # 测到就裁掉，预览和录像都只保留有画面的部分。
@@ -663,7 +745,8 @@ class Recorder:
         writer = self._make_writer(path, self.fps, self.frame_size)
         if not writer.isOpened():
             return False, "写视频文件失败：请检查保存文件夹是否可写。"
-        # 状态和预录制写入都在同一把锁里做，避免采集线程同时写
+        # 只换状态不写帧：预录制帧存下来让采集循环写，扫码立即返回不卡界面。
+        # （以前这里同步解码+写 150 帧，4K 下界面卡好几秒，正好撞上放大窗口。）
         with self._writer_lock:
             self.writer = writer
             self.tracking_no = tracking_no
@@ -688,21 +771,14 @@ class Recorder:
             preroll_items = list(self._preroll) if self._preroll else []
             self._seg_start = preroll_items[0][1] if preroll_items \
                 else self.record_start
-            for jpg_bytes, _t in preroll_items:
-                try:
-                    arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
-                    f = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if f is not None:
-                        self.writer.write(f)
-                        self._seg_written += 1
-                except Exception:
-                    pass
+            self._pending_preroll = preroll_items
         return True, "开始录制：%s" % fname
 
     def stop_recording(self, save=True):
         with self._writer_lock:
             if not self.recording:
                 return None
+            self._pending_preroll = None  # 没写完的预录制直接丢掉，不带进下一段
             path = getattr(self, "_current_path", "")
             seg_written = getattr(self, "_seg_written", 0)
             if self.writer:
@@ -830,10 +906,19 @@ class Recorder:
                 and self._zoom_from <= time.time() <= (self._zoom_until or 0))
 
     def _zoom_frame(self, frame):
-        """数字放大：裁取景框区域再放大回全尺寸。"""
+        """数字放大：裁取景框区域再放大回全尺寸。
+        输出复用一块预分配缓冲（尺寸变了才重分），不再每帧新分一张 4K 大图。
+        下游都是同步消费或复制（_burn_overlay 原地改、latest_frame.copy()、
+        writer.write 同步编码、on_frame 进队列后界面立即 copy），复用安全。"""
         x1, y1, x2, y2 = self.guide_rect()
         crop = frame[y1:y2, x1:x2]
-        return cv2.resize(crop, self.frame_size)
+        w, h = self.frame_size
+        buf = self._zoom_buf
+        if buf is None or buf.shape[0] != h or buf.shape[1] != w:
+            buf = np.empty((h, w, 3), dtype=np.uint8)
+            self._zoom_buf = buf
+        cv2.resize(crop, (w, h), dst=buf)
+        return buf
 
     def _rotate_segment(self):
         """到分段时长：关掉当前文件，另开一段继续录（同单号 _part2）。
@@ -941,33 +1026,58 @@ class Recorder:
                 if ok_j:
                     self._preroll.append((buf.tobytes(), time.time()))
             if self.recording:
-                with self._writer_lock:
-                    if not self.recording or not self.writer:
-                        pass
-                    else:
-                        self.writer.write(frame)
-                        self._seg_written = getattr(self, "_seg_written", 0) + 1
-                        now = time.time()
-                        # 单段最长录制时长（默认 200 秒）
-                        max_sec = int(self.cfg.get("max_record_seconds") or 0)
-                        if max_sec > 0 and self.record_start and \
-                                now - self.record_start > max_sec:
-                            path = self.stop_recording(save=True)
-                            if path:
-                                self.on_status("AUTO_SAVED::" + path)
-                        else:
-                            # 分段（默认 300 秒一段）
-                            seg_sec = int(self.cfg.get("segment_seconds") or 0)
-                            if seg_sec > 0 and self._segment_start and \
-                                    now - self._segment_start > seg_sec:
-                                self._rotate_segment()
-                            # 无动作自动停
-                            auto_stop = int(self.cfg.get("auto_stop_seconds") or 0)
-                            if auto_stop > 0 and self.last_motion and \
-                                    now - self.last_motion > auto_stop:
+                # 先把待写预录制帧写进去（start_recording 只存不写，扫码不卡界面）。
+                # 每帧单独拿锁：中途停录/换段能立刻插进来，界面不会被整个
+                # flush 卡住；换了 writer（新扫码）或停录就丢掉剩余的旧预录制帧。
+                pending = getattr(self, "_pending_preroll", None)
+                if pending:
+                    self._pending_preroll = None
+                    w = self.writer
+                    if w is not None:
+                        for jpg_bytes, _t in pending:
+                            with self._writer_lock:
+                                if not self.recording or self.writer is not w:
+                                    break
+                                try:
+                                    arr = np.frombuffer(jpg_bytes,
+                                                        dtype=np.uint8)
+                                    f = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                                    if f is not None:
+                                        w.write(f)
+                                        self._seg_written = getattr(
+                                            self, "_seg_written", 0) + 1
+                                except Exception:
+                                    pass
+                # 实时帧：非阻塞拿锁，拿不到就跳过这帧的写入（那几帧已被
+                # 预录制覆盖），预览 on_frame 照常走，不让循环卡在锁上。
+                if self._writer_lock.acquire(blocking=False):
+                    try:
+                        if self.recording and self.writer:
+                            self.writer.write(frame)
+                            self._seg_written = getattr(self, "_seg_written", 0) + 1
+                            now = time.time()
+                            # 单段最长录制时长（默认 200 秒）
+                            max_sec = int(self.cfg.get("max_record_seconds") or 0)
+                            if max_sec > 0 and self.record_start and \
+                                    now - self.record_start > max_sec:
                                 path = self.stop_recording(save=True)
                                 if path:
                                     self.on_status("AUTO_SAVED::" + path)
+                            else:
+                                # 分段（默认 300 秒一段）
+                                seg_sec = int(self.cfg.get("segment_seconds") or 0)
+                                if seg_sec > 0 and self._segment_start and \
+                                        now - self._segment_start > seg_sec:
+                                    self._rotate_segment()
+                                # 无动作自动停
+                                auto_stop = int(self.cfg.get("auto_stop_seconds") or 0)
+                                if auto_stop > 0 and self.last_motion and \
+                                        now - self.last_motion > auto_stop:
+                                    path = self.stop_recording(save=True)
+                                    if path:
+                                        self.on_status("AUTO_SAVED::" + path)
+                    finally:
+                        self._writer_lock.release()
             self.on_frame(frame)
             self._fps_count += 1
             _now = time.time()
@@ -1277,15 +1387,31 @@ class App:
         self.video_label.bind("<Double-Button-1>",
                               lambda e: self._toggle_fullscreen())
         self.root.bind("<Escape>", lambda e: self._set_fullscreen(False))
+        # 预览区右下角常驻全屏小按钮（盖在画面上，不挡录制红框和单号大字条）：
+        # 点它和顶栏“全屏”一样进全屏，复用 _toggle_fullscreen
+        self.fs_preview_btn = tk.Button(
+            video_wrap, text="⛶ 全屏", font=self.F_SMALL,
+            bg="#1C2B3A", fg="white", activebackground="#2A3B4F",
+            activeforeground="white", relief="flat", bd=0,
+            padx=8, pady=3, cursor="hand2",
+            command=self._toggle_fullscreen)
+        self.fs_preview_btn.place(relx=1.0, rely=1.0, anchor="se", x=-8, y=-8)
         # 今日已录侧栏（双击一行打开视频）
-        side = tk.Frame(mid, bg=self.C_CARD,
+        side = self.side = tk.Frame(mid, bg=self.C_CARD,
                         highlightbackground=self.C_LINE, highlightthickness=1,
                         width=260)
         side.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         side.pack_propagate(False)
-        tk.Label(side, text="今日已录", bg=self.C_CARD, fg=self.C_TEXT,
-                 font=("Microsoft YaHei", 12, "bold")).pack(
-                     anchor="w", padx=12, pady=(10, 2))
+        side_head = tk.Frame(side, bg=self.C_CARD)
+        side_head.pack(fill=tk.X, padx=12, pady=(10, 2))
+        tk.Label(side_head, text="今日已录", bg=self.C_CARD, fg=self.C_TEXT,
+                 font=("Microsoft YaHei", 12, "bold")).pack(side=tk.LEFT)
+        self.side_collapse_btn = tk.Button(
+            side_head, text="◀ 收起", font=self.F_SMALL,
+            bg=self.C_CARD, fg=self.C_MUTED, activebackground=self.C_CARD,
+            relief="flat", bd=0, padx=6, pady=2, cursor="hand2",
+            command=lambda: self._set_sidebar_collapsed(True))
+        self.side_collapse_btn.pack(side=tk.RIGHT)
         self.today_count_label = tk.Label(side, text="共 0 单", bg=self.C_CARD,
                                           fg=self.C_MUTED, font=self.F_SMALL)
         self.today_count_label.pack(anchor="w", padx=12)
@@ -1299,6 +1425,18 @@ class App:
         self.today_tree.column("dur", width=44)
         self.today_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.today_tree.bind("<Double-1>", self._open_today_video)
+        # 侧栏收起后留在画面右侧边缘的展开小按钮（平时隐藏）
+        self.side_expand_btn = tk.Button(
+            video_wrap, text="▶", font=self.F_SMALL,
+            bg="#1C2B3A", fg="white", activebackground="#2A3B4F",
+            activeforeground="white", relief="flat", bd=0,
+            padx=6, pady=10, cursor="hand2",
+            command=lambda: self._set_sidebar_collapsed(False))
+        # 恢复上次的收起状态（默认展开）
+        self._side_collapsed = False
+        self._fullscreen = False  # 全屏状态自记：不依赖窗口管理器回读
+        if self.cfg.get("sidebar_collapsed"):
+            self._set_sidebar_collapsed(True)
 
         # ===== 底部操作卡片 =====
         bottom = tk.Frame(self.root, bg=self.C_CARD,
@@ -1349,7 +1487,10 @@ class App:
 
     def _set_fullscreen(self, on):
         """全屏开关：铺满整个屏幕，顶栏、扫码区、底部状态栏都还在，
-        画面区跟着变大。Esc 或再点“退出全屏”或双击画面都能退出。"""
+        画面区跟着变大。Esc 或再点“退出全屏”或双击画面都能退出。
+        状态自记在 self._fullscreen（窗口管理器回读在无 WM 环境下
+        恒为 False，开关会卡在“进全屏”，故不以它为准）。"""
+        self._fullscreen = bool(on)
         try:
             self.root.attributes("-fullscreen", bool(on))
         except Exception:
@@ -1358,13 +1499,33 @@ class App:
             self.fs_btn.config(text="退出全屏" if on else "全屏")
         except Exception:
             pass
+        try:
+            self.fs_preview_btn.config(
+                text="⛶ 退出全屏" if on else "⛶ 全屏")
+        except Exception:
+            pass
+
+    def _set_sidebar_collapsed(self, collapsed):
+        """今日已录侧栏收起/展开：收起后侧栏隐藏、画面区自动扩满，
+        画面右侧边缘留一个 ▶ 小按钮点开；状态存 config，下次打开保持。"""
+        collapsed = bool(collapsed)
+        self._side_collapsed = collapsed
+        try:
+            if collapsed:
+                self.side.pack_forget()
+                self.side_expand_btn.place(relx=1.0, rely=0.5,
+                                           anchor="e", x=-2)
+            else:
+                self.side_expand_btn.place_forget()
+                self.side.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        except Exception:
+            pass
+        if bool(self.cfg.get("sidebar_collapsed", False)) != collapsed:
+            self.cfg["sidebar_collapsed"] = collapsed
+            save_config(self.cfg)
 
     def _toggle_fullscreen(self, event=None):
-        try:
-            cur = bool(self.root.attributes("-fullscreen"))
-        except Exception:
-            cur = False
-        self._set_fullscreen(not cur)
+        self._set_fullscreen(not getattr(self, "_fullscreen", False))
 
     def _set_recording_chrome(self, on):
         """录制状态更醒目：录制时顶栏变红、画面区加粗红框；停录恢复原样。"""
@@ -1559,8 +1720,18 @@ class App:
             fps = self.rec.loop_fps
             if fps > 0:
                 low = fps < 20
+                # 状态栏显示摄像头真实格式与分辨率（回读来的，不是设置值）：
+                # 如 “MJPG 1920×1080 · 处理 30帧/秒”；没回读到就只显示处理帧率
+                fmt = getattr(self.rec, "_cam_fourcc", "") or ""
+                if fmt:
+                    w, h = self.rec.frame_size
+                    text = "%s %dx%d · 处理 %.0f 帧/秒%s" % (
+                        fmt, w, h, fps, "（偏低）" if low else "")
+                else:
+                    text = "处理 %.0f 帧/秒%s" % (
+                        fps, "（偏低）" if low else "")
                 self.fps_label.config(
-                    text="处理 %.0f 帧/秒%s" % (fps, "（偏低）" if low else ""),
+                    text=text,
                     fg="#DC2626" if low else self.C_MUTED)
         except Exception:
             pass
